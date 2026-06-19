@@ -1,0 +1,284 @@
+name: Build meta-voice-chat-aec3
+
+on:
+  push:
+    branches: [ main, master, dev-metater ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            tool: cargo
+          - name: windows-i686
+            os: windows-latest
+            target: i686-pc-windows-msvc
+            tool: cargo
+          - name: windows-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            tool: cargo
+
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            tool: cargo
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            tool: cargo
+
+          - name: ios-arm64-device
+            os: macos-latest
+            target: aarch64-apple-ios
+            tool: cargo
+          - name: ios-arm64-simulator
+            os: macos-latest
+            target: aarch64-apple-ios-sim
+            tool: cargo
+          - name: ios-x86_64-simulator
+            os: macos-latest
+            target: x86_64-apple-ios
+            tool: cargo
+
+          - name: linux-x86_64-gnu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            tool: cargo
+          - name: linux-arm64-gnu
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            tool: cross
+          - name: linux-armv7-gnu
+            os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            tool: cross
+
+          - name: android-arm64
+            os: ubuntu-latest
+            target: aarch64-linux-android
+            tool: android
+            api: 23
+          - name: android-armv7
+            os: ubuntu-latest
+            target: armv7-linux-androideabi
+            tool: android
+            api: 23
+          - name: android-x86_64
+            os: ubuntu-latest
+            target: x86_64-linux-android
+            tool: android
+            api: 23
+          - name: android-x86
+            os: ubuntu-latest
+            target: i686-linux-android
+            tool: android
+            api: 23
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.tool == 'cross'
+        uses: taiki-e/install-action@cross
+
+      - name: Setup Android NDK
+        if: matrix.tool == 'android'
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Configure Android linker
+        if: matrix.tool == 'android'
+        shell: bash
+        run: |
+          mkdir -p .cargo
+          host_tag=linux-x86_64
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host_tag/bin"
+          rust_target_env=$(printf '%s' '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')
+
+          case '${{ matrix.target }}' in
+            aarch64-linux-android)
+              clang_target="aarch64-linux-android${{ matrix.api }}"
+              rustflags='rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]'
+              ;;
+            armv7-linux-androideabi)
+              clang_target="armv7a-linux-androideabi${{ matrix.api }}"
+              rustflags=""
+              ;;
+            x86_64-linux-android)
+              clang_target="x86_64-linux-android${{ matrix.api }}"
+              rustflags=""
+              ;;
+            i686-linux-android)
+              clang_target="i686-linux-android${{ matrix.api }}"
+              rustflags=""
+              ;;
+            *)
+              echo "Unsupported Android target: ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+
+          cat > .cargo/config.toml <<EOF
+          [target.${{ matrix.target }}]
+          linker = "$toolchain/$clang_target-clang"
+          ar = "$toolchain/llvm-ar"
+          $rustflags
+          EOF
+
+          echo "CC_${rust_target_env}=$toolchain/$clang_target-clang" >> "$GITHUB_ENV"
+          echo "AR_${rust_target_env}=$toolchain/llvm-ar" >> "$GITHUB_ENV"
+
+      - name: Build
+        if: matrix.tool == 'cargo'
+        run: cargo build --release --target ${{ matrix.target }} --lib
+
+      - name: Build with cross
+        if: matrix.tool == 'cross'
+        run: cross build --release --target ${{ matrix.target }} --lib
+
+      - name: Build for Android
+        if: matrix.tool == 'android'
+        run: cargo build --release --target ${{ matrix.target }} --lib
+
+      - name: Prepare artifacts
+        shell: pwsh
+        run: |
+          $artifactDir = "artifacts/${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+
+          $releaseDir = "target/${{ matrix.target }}/release"
+          $patterns = @("*.dll", "*.dll.lib", "*.pdb", "*.so", "*.dylib")
+          foreach ($pattern in $patterns) {
+            Get-ChildItem -Path $releaseDir -Filter $pattern -File -ErrorAction SilentlyContinue |
+              Copy-Item -Destination $artifactDir -Force
+          }
+
+          @"
+          target=${{ matrix.target }}
+          profile=release
+          crate=meta-voice-chat-aec3
+          "@ | Set-Content -Path "$artifactDir/build-info.txt"
+
+          if (-not (Get-ChildItem -Path $artifactDir -File | Where-Object { $_.Name -ne 'build-info.txt' })) {
+            Write-Error "No dynamic library artifact was found in $releaseDir"
+          }
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: meta-voice-chat-aec3-${{ matrix.name }}
+          path: artifacts/${{ matrix.name }}/*
+          if-no-files-found: error
+
+  combine-artifacts:
+    name: Combine artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    if: always() && needs.build.result == 'success'
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: all-artifacts
+
+      - name: Combine artifacts
+        shell: bash
+        run: |
+          mkdir -p combined/platforms combined/unity/Assets/Plugins
+          for artifact_dir in all-artifacts/meta-voice-chat-aec3-*; do
+            platform_name=$(basename "$artifact_dir" | sed 's/^meta-voice-chat-aec3-//')
+            mkdir -p "combined/platforms/$platform_name"
+            cp -R "$artifact_dir"/. "combined/platforms/$platform_name/"
+          done
+
+          copy_first_match() {
+            local source_dir="$1"
+            local dest_dir="$2"
+            shift 2
+            mkdir -p "$dest_dir"
+            for pattern in "$@"; do
+              find "$source_dir" -maxdepth 1 -type f -name "$pattern" -exec cp {} "$dest_dir/" \;
+            done
+          }
+
+          copy_first_match combined/platforms/windows-x86_64 combined/unity/Assets/Plugins/Windows/x86_64 "*.dll" "*.pdb"
+          copy_first_match combined/platforms/windows-i686 combined/unity/Assets/Plugins/Windows/x86 "*.dll" "*.pdb"
+          copy_first_match combined/platforms/windows-arm64 combined/unity/Assets/Plugins/Windows/ARM64 "*.dll" "*.pdb"
+
+          copy_first_match combined/platforms/macos-arm64 combined/unity/Assets/Plugins/macOS/arm64 "*.dylib"
+          copy_first_match combined/platforms/macos-x86_64 combined/unity/Assets/Plugins/macOS/x86_64 "*.dylib"
+
+          copy_first_match combined/platforms/ios-arm64-device combined/unity/Assets/Plugins/iOS/arm64 "*.dylib"
+          copy_first_match combined/platforms/ios-arm64-simulator combined/unity/Assets/Plugins/iOS/Simulator/arm64 "*.dylib"
+          copy_first_match combined/platforms/ios-x86_64-simulator combined/unity/Assets/Plugins/iOS/Simulator/x86_64 "*.dylib"
+
+          copy_first_match combined/platforms/linux-x86_64-gnu combined/unity/Assets/Plugins/Linux/x86_64 "*.so"
+          copy_first_match combined/platforms/linux-arm64-gnu combined/unity/Assets/Plugins/Linux/arm64 "*.so"
+          copy_first_match combined/platforms/linux-armv7-gnu combined/unity/Assets/Plugins/Linux/armv7 "*.so"
+
+          copy_first_match combined/platforms/android-arm64 combined/unity/Assets/Plugins/Android/libs/arm64-v8a "*.so"
+          copy_first_match combined/platforms/android-armv7 combined/unity/Assets/Plugins/Android/libs/armeabi-v7a "*.so"
+          copy_first_match combined/platforms/android-x86_64 combined/unity/Assets/Plugins/Android/libs/x86_64 "*.so"
+          copy_first_match combined/platforms/android-x86 combined/unity/Assets/Plugins/Android/libs/x86 "*.so"
+
+          cat > combined/README.md <<'EOF'
+          # meta-voice-chat-aec3 Builds
+
+          Release cdylib builds produced by GitHub Actions.
+
+          Contents:
+          - platforms/ contains the raw artifacts exactly as produced by each matrix job.
+          - unity/Assets/Plugins/ is arranged for copying into a Unity project.
+          - meta-voice-chat-aec3-unity-plugins.zip contains the Unity plugin tree.
+
+          Included platform groups:
+          - windows-x86_64, windows-i686, windows-arm64
+          - macos-arm64, macos-x86_64
+          - ios-arm64-device, ios-arm64-simulator, ios-x86_64-simulator
+          - linux-x86_64-gnu, linux-arm64-gnu, linux-armv7-gnu
+          - android-arm64, android-armv7, android-x86_64, android-x86
+
+          This project does not depend on Opus, CMake, ALSA, CPAL, or WASM/browser tooling.
+          Android arm64 is linked with `-Wl,-z,max-page-size=16384` for 16 KB page-size compatibility.
+          EOF
+
+          cat > combined/unity/README.md <<'EOF'
+          # Unity Import
+
+          Copy the `Assets` folder from this directory into your Unity project, or unzip
+          `meta-voice-chat-aec3-unity-plugins.zip` at the root of your Unity project.
+
+          Android libraries are placed under `Assets/Plugins/Android/libs/<abi>/`.
+          Desktop and Apple platform libraries are grouped under `Assets/Plugins/<platform>/`.
+          EOF
+
+          (cd combined/unity && zip -r ../meta-voice-chat-aec3-unity-plugins.zip Assets README.md)
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: meta-voice-chat-aec3-all-platforms
+          path: combined/
+          if-no-files-found: error
