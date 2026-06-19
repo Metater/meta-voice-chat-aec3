@@ -63,19 +63,10 @@ jobs:
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             tool: cross
-          - name: linux-armv7-gnu
-            os: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            tool: cross
 
           - name: android-arm64
             os: ubuntu-latest
             target: aarch64-linux-android
-            tool: android
-            api: 23
-          - name: android-armv7
-            os: ubuntu-latest
-            target: armv7-linux-androideabi
             tool: android
             api: 23
           - name: android-x86_64
@@ -121,10 +112,6 @@ jobs:
             aarch64-linux-android)
               clang_target="aarch64-linux-android${{ matrix.api }}"
               rustflags='rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]'
-              ;;
-            armv7-linux-androideabi)
-              clang_target="armv7a-linux-androideabi${{ matrix.api }}"
-              rustflags=""
               ;;
             x86_64-linux-android)
               clang_target="x86_64-linux-android${{ matrix.api }}"
@@ -236,10 +223,8 @@ jobs:
 
           copy_first_match combined/platforms/linux-x86_64-gnu combined/unity/Assets/Plugins/Linux/x86_64 "*.so"
           copy_first_match combined/platforms/linux-arm64-gnu combined/unity/Assets/Plugins/Linux/arm64 "*.so"
-          copy_first_match combined/platforms/linux-armv7-gnu combined/unity/Assets/Plugins/Linux/armv7 "*.so"
 
           copy_first_match combined/platforms/android-arm64 combined/unity/Assets/Plugins/Android/libs/arm64-v8a "*.so"
-          copy_first_match combined/platforms/android-armv7 combined/unity/Assets/Plugins/Android/libs/armeabi-v7a "*.so"
           copy_first_match combined/platforms/android-x86_64 combined/unity/Assets/Plugins/Android/libs/x86_64 "*.so"
           copy_first_match combined/platforms/android-x86 combined/unity/Assets/Plugins/Android/libs/x86 "*.so"
 
@@ -257,11 +242,13 @@ jobs:
           - windows-x86_64, windows-i686, windows-arm64
           - macos-arm64, macos-x86_64
           - ios-arm64-device, ios-arm64-simulator, ios-x86_64-simulator
-          - linux-x86_64-gnu, linux-arm64-gnu, linux-armv7-gnu
-          - android-arm64, android-armv7, android-x86_64, android-x86
+          - linux-x86_64-gnu, linux-arm64-gnu
+          - android-arm64, android-x86_64, android-x86
 
           This project does not depend on Opus, CMake, ALSA, CPAL, or WASM/browser tooling.
           Android arm64 is linked with `-Wl,-z,max-page-size=16384` for 16 KB page-size compatibility.
+          ARMv7 targets are not built because aec3 0.3.0 currently uses Rust-gated 32-bit ARM
+          NEON intrinsics/target features that do not compile on stable Rust.
           EOF
 
           cat > combined/unity/README.md <<'EOF'
