@@ -46,7 +46,6 @@ name = "meta-voice-chat-aec3"
 version = "0.1.0"
 dependencies = [
  "aec3",
- "rustfft",
 ]
 
 [[package]]

@@ -1,115 +1,363 @@
-use std::mem::{align_of, size_of};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr;
+#![allow(clippy::missing_safety_doc)] // The C ABI uses one shared pointer-safety contract.
 
-use aec3::api::control::{EchoControl, Metrics};
-use aec3::audio_processing::aec3::echo_canceller3::EchoCanceller3;
-use aec3::audio_processing::agc2::cpu_features::get_available_cpu_features;
-use aec3::audio_processing::agc2::input_volume_controller::Config as InputVolumeControllerConfig;
-use aec3::audio_processing::agc2::limiter::Limiter;
-use aec3::audio_processing::agc2::vad_wrapper::VoiceActivityDetectorWrapper;
-use aec3::audio_processing::audio_buffer::AudioBuffer;
-use aec3::audio_processing::gain_controller2::{GainController2, GainController2Config};
-use aec3::audio_processing::high_pass_filter::HighPassFilter;
-use aec3::audio_processing::ns::{NoiseSuppressor, NsConfig, SuppressionLevel};
-use aec3::audio_processing::resampler::push_sinc_resampler::PushSincResampler;
-use aec3::audio_processing::stream_config::StreamConfig;
-use rustfft::{FftPlanner, num_complex::Complex32};
+//! C ABI wrapper around the low-level AEC3-RS processors.
+//!
+//! Input and output audio is interleaved, normalized `f32` PCM in the
+//! `[-1.0, 1.0]` range. Every handle is intentionally single-threaded. Create
+//! one handle for each independent audio path and call its functions in order:
+//! high-pass filter -> AEC3 -> AGC2. WebRTC noise suppression is deliberately
+//! not part of this wrapper so an external RNNoise/RNN noise processor can sit
+//! between AEC3 and AGC2.
 
+mod common;
+mod echo_canceller;
+mod gain_controller;
+mod high_pass_filter;
+
+use std::mem::size_of;
+
+use common::{
+    checked_f32_slice, checked_f32_slice_mut, checked_mut, checked_ref, ffi_create, ffi_status,
+    optional_output,
+};
+use echo_canceller::EchoCancellerHandle;
+use gain_controller::GainControllerHandle;
+use high_pass_filter::HighPassHandle;
+
+/// Operation completed successfully.
 pub const META_AEC3_OK: i32 = 0;
-pub const META_AEC3_NEEDS_RNNOISE: i32 = 1;
+/// A required pointer was null or not suitably aligned.
 pub const META_AEC3_NULL_POINTER: i32 = -1;
+/// A creation or reconfiguration option is unsupported or internally invalid.
 pub const META_AEC3_INVALID_CONFIG: i32 = -2;
+/// An operation argument is invalid for the handle's fixed audio format.
 pub const META_AEC3_INVALID_ARGUMENT: i32 = -3;
+/// A supplied output buffer cannot hold the requested result.
 pub const META_AEC3_BUFFER_TOO_SMALL: i32 = -4;
-pub const META_AEC3_NO_PENDING_RNNOISE: i32 = -5;
+/// Rust caught an internal panic before it could cross the C ABI boundary.
 pub const META_AEC3_PANIC: i32 = -99;
 
-pub const META_AEC3_NS_NONE: i32 = 0;
-pub const META_AEC3_NS_WEBRTC: i32 = 1;
-pub const META_AEC3_NS_RNNOISE: i32 = 2;
-
-pub const META_AEC3_NS_LEVEL_6_DB: i32 = 0;
-pub const META_AEC3_NS_LEVEL_12_DB: i32 = 1;
-pub const META_AEC3_NS_LEVEL_18_DB: i32 = 2;
-pub const META_AEC3_NS_LEVEL_21_DB: i32 = 3;
-
+/// Creation options for a high-pass filter.
+///
+/// The underlying WebRTC high-pass filter supports 16, 32, and 48 kHz. Audio
+/// passed to `meta_aec3_high_pass_process` may contain any positive frame size.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct MetaAec3Config {
+#[derive(Clone, Copy, Debug)]
+pub struct MetaAec3HighPassConfig {
     pub sample_rate_hz: i32,
-    pub render_sample_rate_hz: i32,
-    pub frame_size_ms: i32,
-    pub capture_channels: i32,
-    pub render_channels: i32,
-    pub enable_high_pass_filter: i32,
-    pub enable_aec3: i32,
-    pub noise_suppression_mode: i32,
-    pub noise_suppression_level: i32,
-    pub enable_agc2: i32,
-    pub agc2_fixed_gain_db: f32,
-    pub agc2_adaptive_digital: i32,
-    pub agc2_input_volume_controller: i32,
-    pub applied_input_volume: i32,
-    pub capture_output_used: i32,
-    pub user_microphone_gain: f32,
-    pub enable_post_limiter: i32,
-    pub initial_delay_ms: i32,
-    pub vad_threshold: f32,
-    pub export_linear_aec_output: i32,
+    pub channels: i32,
 }
 
-impl Default for MetaAec3Config {
+impl Default for MetaAec3HighPassConfig {
     fn default() -> Self {
         Self {
             sample_rate_hz: 48_000,
-            render_sample_rate_hz: 48_000,
-            frame_size_ms: 10,
-            capture_channels: 1,
-            render_channels: 2,
-            enable_high_pass_filter: 1,
-            enable_aec3: 1,
-            noise_suppression_mode: META_AEC3_NS_WEBRTC,
-            noise_suppression_level: META_AEC3_NS_LEVEL_12_DB,
-            enable_agc2: 1,
-            agc2_fixed_gain_db: 0.0,
-            agc2_adaptive_digital: 1,
-            agc2_input_volume_controller: 0,
-            applied_input_volume: 255,
-            capture_output_used: 1,
-            user_microphone_gain: 1.0,
-            enable_post_limiter: 1,
-            initial_delay_ms: 0,
-            vad_threshold: 0.5,
-            export_linear_aec_output: 0,
+            channels: 1,
         }
     }
 }
 
+/// Optional analysis returned by `meta_aec3_high_pass_process`.
 #[repr(C)]
-#[derive(Debug)]
-pub struct MetaAec3Stats {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetaAec3HighPassStats {
     pub struct_size: i32,
-    pub status: i32,
+    pub sample_rate_hz: i32,
+    pub channels: i32,
+    pub processed_samples: i32,
+    pub total_processed_samples: u64,
+    pub output_rms: f32,
+    pub output_peak: f32,
+}
+
+/// Creation options for AEC3. Initialize with
+/// `meta_aec3_aec_default_config` and alter only the controls you need.
+///
+/// Render supports 1-8 interleaved channels; capture supports mono or stereo.
+/// Both sides use the same 16, 32, or 48 kHz rate. Processing accepts one or
+/// more complete 10-ms frames per call.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MetaAec3AecConfig {
+    pub sample_rate_hz: i32,
+    pub render_channels: i32,
+    pub capture_channels: i32,
+    pub initial_delay_ms: i32,
+    pub fixed_capture_delay_samples: i32,
+
+    pub excess_render_detection_interval_blocks: i32,
+    pub max_allowed_excess_render_blocks: i32,
+    pub delay_default_blocks: i32,
+    pub delay_down_sampling_factor: i32,
+    pub delay_num_filters: i32,
+    pub delay_headroom_samples: i32,
+    pub delay_hysteresis_limit_blocks: i32,
+    pub delay_estimate_smoothing: f32,
+    pub delay_candidate_detection_threshold: f32,
+    pub delay_selection_threshold_initial: i32,
+    pub delay_selection_threshold_converged: i32,
+    pub delay_use_external_estimator: i32,
+    pub delay_log_warnings: i32,
+
+    pub render_alignment_downmix: i32,
+    pub render_alignment_adaptive_selection: i32,
+    pub render_alignment_activity_power_threshold: f32,
+    pub render_alignment_prefer_first_two_channels: i32,
+    pub capture_alignment_downmix: i32,
+    pub capture_alignment_adaptive_selection: i32,
+    pub capture_alignment_activity_power_threshold: f32,
+    pub capture_alignment_prefer_first_two_channels: i32,
+
+    pub main_filter_length_blocks: i32,
+    pub main_filter_leakage_converged: f32,
+    pub main_filter_leakage_diverged: f32,
+    pub main_filter_error_floor: f32,
+    pub main_filter_error_ceil: f32,
+    pub main_filter_noise_gate: f32,
+    pub main_initial_filter_length_blocks: i32,
+    pub main_initial_filter_leakage_converged: f32,
+    pub main_initial_filter_leakage_diverged: f32,
+    pub main_initial_filter_error_floor: f32,
+    pub main_initial_filter_error_ceil: f32,
+    pub main_initial_filter_noise_gate: f32,
+    pub shadow_filter_length_blocks: i32,
+    pub shadow_initial_filter_length_blocks: i32,
+    pub shadow_filter_rate: f32,
+    pub shadow_filter_noise_gate: f32,
+    pub shadow_initial_filter_rate: f32,
+    pub shadow_initial_filter_noise_gate: f32,
+    pub filter_config_change_duration_blocks: i32,
+    pub filter_initial_state_seconds: f32,
+    pub shadow_reset_hangover_blocks: i32,
+    pub use_shadow_reset_hangover: i32,
+    pub conservative_initial_phase: i32,
+    pub enable_shadow_filter_output_usage: i32,
+    pub use_linear_filter: i32,
+    pub export_linear_aec_output: i32,
+
+    pub erle_min: f32,
+    pub erle_max_low: f32,
+    pub erle_max_high: f32,
+    pub erle_onset_detection: i32,
+    pub erle_num_sections: i32,
+    pub erle_clamp_to_zero: i32,
+    pub erle_clamp_to_one: i32,
+    pub ep_strength_default_gain: f32,
+    pub ep_strength_default_len: f32,
+    pub ep_strength_echo_can_saturate: i32,
+    pub ep_strength_bounded_erl: i32,
+    pub echo_audibility_low_render_limit: f32,
+    pub echo_audibility_normal_render_limit: f32,
+    pub echo_audibility_floor_power: f32,
+    pub echo_audibility_threshold_lf: f32,
+    pub echo_audibility_threshold_mf: f32,
+    pub echo_audibility_threshold_hf: f32,
+    pub echo_audibility_use_stationarity_properties: i32,
+    pub echo_audibility_use_stationarity_properties_at_init: i32,
+    pub render_levels_active_render_limit: f32,
+    pub render_levels_poor_excitation_render_limit: f32,
+    pub render_levels_poor_excitation_render_limit_ds8: f32,
+    pub render_levels_render_power_gain_db: f32,
+    pub has_clock_drift: i32,
+    pub linear_and_stable_echo_path: i32,
+    pub enable_transparent_mode: i32,
+    pub transparent_mode_use_hmm: i32,
+
+    pub echo_model_noise_floor_hold: i32,
+    pub echo_model_min_noise_floor_power: f32,
+    pub echo_model_stationary_gate_slope: f32,
+    pub echo_model_noise_gate_power: f32,
+    pub echo_model_noise_gate_slope: f32,
+    pub echo_model_render_pre_window_size: i32,
+    pub echo_model_render_post_window_size: i32,
+
+    pub suppressor_nearend_average_blocks: i32,
+    pub suppressor_normal_lf_enr_transparent: f32,
+    pub suppressor_normal_lf_enr_suppress: f32,
+    pub suppressor_normal_lf_emr_transparent: f32,
+    pub suppressor_normal_hf_enr_transparent: f32,
+    pub suppressor_normal_hf_enr_suppress: f32,
+    pub suppressor_normal_hf_emr_transparent: f32,
+    pub suppressor_normal_max_inc_factor: f32,
+    pub suppressor_normal_max_dec_factor_lf: f32,
+    pub suppressor_nearend_lf_enr_transparent: f32,
+    pub suppressor_nearend_lf_enr_suppress: f32,
+    pub suppressor_nearend_lf_emr_transparent: f32,
+    pub suppressor_nearend_hf_enr_transparent: f32,
+    pub suppressor_nearend_hf_enr_suppress: f32,
+    pub suppressor_nearend_hf_emr_transparent: f32,
+    pub suppressor_nearend_max_inc_factor: f32,
+    pub suppressor_nearend_max_dec_factor_lf: f32,
+    pub dominant_nearend_enr_threshold: f32,
+    pub dominant_nearend_enr_exit_threshold: f32,
+    pub dominant_nearend_snr_threshold: f32,
+    pub dominant_nearend_hold_duration: i32,
+    pub dominant_nearend_trigger_threshold: i32,
+    pub dominant_nearend_use_during_initial_phase: i32,
+    pub subband_nearend_average_blocks: i32,
+    pub subband1_low: i32,
+    pub subband1_high: i32,
+    pub subband2_low: i32,
+    pub subband2_high: i32,
+    pub subband_nearend_threshold: f32,
+    pub subband_snr_threshold: f32,
+    pub enable_subband_nearend_detection: i32,
+    pub high_bands_enr_threshold: f32,
+    pub high_bands_max_gain_during_echo: f32,
+    pub high_bands_anti_howling_activation_threshold: f32,
+    pub high_bands_anti_howling_gain: f32,
+    pub suppressor_floor_first_increase: f32,
+
+    /// Only affects the exported VAD flag in `MetaAec3AecStats`.
+    pub vad_threshold: f32,
+}
+
+impl Default for MetaAec3AecConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate_hz: 48_000,
+            render_channels: 1,
+            capture_channels: 1,
+            initial_delay_ms: 0,
+            fixed_capture_delay_samples: 0,
+            excess_render_detection_interval_blocks: 250,
+            max_allowed_excess_render_blocks: 8,
+            delay_default_blocks: 5,
+            delay_down_sampling_factor: 4,
+            delay_num_filters: 5,
+            delay_headroom_samples: 32,
+            delay_hysteresis_limit_blocks: 1,
+            delay_estimate_smoothing: 0.7,
+            delay_candidate_detection_threshold: 0.2,
+            delay_selection_threshold_initial: 5,
+            delay_selection_threshold_converged: 20,
+            delay_use_external_estimator: 0,
+            delay_log_warnings: 0,
+            render_alignment_downmix: 0,
+            render_alignment_adaptive_selection: 1,
+            render_alignment_activity_power_threshold: 10_000.0,
+            render_alignment_prefer_first_two_channels: 1,
+            capture_alignment_downmix: 0,
+            capture_alignment_adaptive_selection: 1,
+            capture_alignment_activity_power_threshold: 10_000.0,
+            capture_alignment_prefer_first_two_channels: 0,
+            main_filter_length_blocks: 13,
+            main_filter_leakage_converged: 0.00005,
+            main_filter_leakage_diverged: 0.05,
+            main_filter_error_floor: 0.001,
+            main_filter_error_ceil: 2.0,
+            main_filter_noise_gate: 20_075_344.0,
+            main_initial_filter_length_blocks: 12,
+            main_initial_filter_leakage_converged: 0.005,
+            main_initial_filter_leakage_diverged: 0.5,
+            main_initial_filter_error_floor: 0.001,
+            main_initial_filter_error_ceil: 2.0,
+            main_initial_filter_noise_gate: 20_075_344.0,
+            shadow_filter_length_blocks: 13,
+            shadow_initial_filter_length_blocks: 12,
+            shadow_filter_rate: 0.7,
+            shadow_filter_noise_gate: 20_075_344.0,
+            shadow_initial_filter_rate: 0.9,
+            shadow_initial_filter_noise_gate: 20_075_344.0,
+            filter_config_change_duration_blocks: 250,
+            filter_initial_state_seconds: 2.5,
+            shadow_reset_hangover_blocks: 25,
+            use_shadow_reset_hangover: 1,
+            conservative_initial_phase: 0,
+            enable_shadow_filter_output_usage: 1,
+            use_linear_filter: 1,
+            export_linear_aec_output: 0,
+            erle_min: 1.0,
+            erle_max_low: 4.0,
+            erle_max_high: 1.5,
+            erle_onset_detection: 1,
+            erle_num_sections: 1,
+            erle_clamp_to_zero: 1,
+            erle_clamp_to_one: 1,
+            ep_strength_default_gain: 1.0,
+            ep_strength_default_len: 0.83,
+            ep_strength_echo_can_saturate: 1,
+            ep_strength_bounded_erl: 0,
+            echo_audibility_low_render_limit: 256.0,
+            echo_audibility_normal_render_limit: 64.0,
+            echo_audibility_floor_power: 128.0,
+            echo_audibility_threshold_lf: 10.0,
+            echo_audibility_threshold_mf: 10.0,
+            echo_audibility_threshold_hf: 10.0,
+            echo_audibility_use_stationarity_properties: 0,
+            echo_audibility_use_stationarity_properties_at_init: 0,
+            render_levels_active_render_limit: 100.0,
+            render_levels_poor_excitation_render_limit: 150.0,
+            render_levels_poor_excitation_render_limit_ds8: 20.0,
+            render_levels_render_power_gain_db: 0.0,
+            has_clock_drift: 0,
+            linear_and_stable_echo_path: 0,
+            enable_transparent_mode: 1,
+            transparent_mode_use_hmm: 0,
+            echo_model_noise_floor_hold: 50,
+            echo_model_min_noise_floor_power: 1_638_400.0,
+            echo_model_stationary_gate_slope: 10.0,
+            echo_model_noise_gate_power: 27_509.42,
+            echo_model_noise_gate_slope: 0.3,
+            echo_model_render_pre_window_size: 1,
+            echo_model_render_post_window_size: 1,
+            suppressor_nearend_average_blocks: 4,
+            suppressor_normal_lf_enr_transparent: 0.3,
+            suppressor_normal_lf_enr_suppress: 0.4,
+            suppressor_normal_lf_emr_transparent: 0.3,
+            suppressor_normal_hf_enr_transparent: 0.07,
+            suppressor_normal_hf_enr_suppress: 0.1,
+            suppressor_normal_hf_emr_transparent: 0.3,
+            suppressor_normal_max_inc_factor: 2.0,
+            suppressor_normal_max_dec_factor_lf: 0.25,
+            suppressor_nearend_lf_enr_transparent: 1.09,
+            suppressor_nearend_lf_enr_suppress: 1.1,
+            suppressor_nearend_lf_emr_transparent: 0.3,
+            suppressor_nearend_hf_enr_transparent: 0.1,
+            suppressor_nearend_hf_enr_suppress: 0.3,
+            suppressor_nearend_hf_emr_transparent: 0.3,
+            suppressor_nearend_max_inc_factor: 2.0,
+            suppressor_nearend_max_dec_factor_lf: 0.25,
+            dominant_nearend_enr_threshold: 0.25,
+            dominant_nearend_enr_exit_threshold: 10.0,
+            dominant_nearend_snr_threshold: 30.0,
+            dominant_nearend_hold_duration: 50,
+            dominant_nearend_trigger_threshold: 12,
+            dominant_nearend_use_during_initial_phase: 1,
+            subband_nearend_average_blocks: 1,
+            subband1_low: 1,
+            subband1_high: 1,
+            subband2_low: 1,
+            subband2_high: 1,
+            subband_nearend_threshold: 1.0,
+            subband_snr_threshold: 1.0,
+            enable_subband_nearend_detection: 0,
+            high_bands_enr_threshold: 1.0,
+            high_bands_max_gain_during_echo: 1.0,
+            high_bands_anti_howling_activation_threshold: 400.0,
+            high_bands_anti_howling_gain: 1.0,
+            suppressor_floor_first_increase: 0.00001,
+            vad_threshold: 0.5,
+        }
+    }
+}
+
+/// Per-capture AEC3 telemetry. Pass a null `stats` pointer to skip it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetaAec3AecStats {
+    pub struct_size: i32,
+    pub sample_rate_hz: i32,
+    pub render_channels: i32,
+    pub capture_channels: i32,
     pub processed_samples: i32,
     pub output_samples: i32,
-    pub aec_tap_samples: i32,
-    pub rnnoise_input_samples: i32,
-    pub speech_16k_samples: i32,
-    pub sample_rate_hz: i32,
-    pub frame_size_ms: i32,
-    pub capture_channels: i32,
-    pub render_channels: i32,
-    pub internal_sample_rate_hz: i32,
-    pub aec_enabled: i32,
-    pub high_pass_enabled: i32,
-    pub noise_suppression_mode: i32,
-    pub vad_probability: f32,
-    pub vad_is_voice: i32,
-    pub rms: f32,
-    pub peak: f32,
-    pub recommended_input_volume: i32,
-    pub post_limiter_applied: i32,
+    pub total_render_samples: u64,
+    pub total_capture_samples: u64,
+    pub voice_probability: f32,
+    pub voice_detected: i32,
+    pub output_rms: f32,
+    pub output_peak: f32,
     pub echo_return_loss: f64,
     pub echo_return_loss_enhancement: f64,
     pub delay_ms: i32,
@@ -117,1313 +365,568 @@ pub struct MetaAec3Stats {
     pub render_jitter_max: i32,
     pub capture_jitter_min: i32,
     pub capture_jitter_max: i32,
-    pub fft_magnitudes: *mut f32,
-    pub fft_capacity: i32,
-    pub fft_bins_written: i32,
-    pub fft_size: i32,
-    pub fft_sample_rate_hz: i32,
 }
 
-impl Default for MetaAec3Stats {
+/// Lightweight AEC3 metrics that can be queried between capture calls.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetaAec3AecMetrics {
+    pub echo_return_loss: f64,
+    pub echo_return_loss_enhancement: f64,
+    pub delay_ms: i32,
+    pub render_jitter_min: i32,
+    pub render_jitter_max: i32,
+    pub capture_jitter_min: i32,
+    pub capture_jitter_max: i32,
+}
+
+/// Creation options for WebRTC AGC2. Initialize with
+/// `meta_aec3_agc2_default_config` before changing values.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MetaAec3Agc2Config {
+    pub sample_rate_hz: i32,
+    pub channels: i32,
+    pub fixed_gain_db: f32,
+    pub enable_adaptive_digital: i32,
+    pub adaptive_headroom_db: f32,
+    pub adaptive_max_gain_db: f32,
+    pub adaptive_initial_gain_db: f32,
+    pub adaptive_max_gain_change_db_per_second: f32,
+    pub adaptive_max_output_noise_level_dbfs: f32,
+    pub enable_input_volume_controller: i32,
+    pub use_internal_vad: i32,
+    pub capture_output_used: i32,
+
+    pub ivc_min_input_volume: i32,
+    pub ivc_clipped_level_min: i32,
+    pub ivc_clipped_level_step: i32,
+    pub ivc_clipped_ratio_threshold: f32,
+    pub ivc_clipped_wait_frames: i32,
+    pub ivc_enable_clipping_predictor: i32,
+    pub ivc_target_range_max_dbfs: i32,
+    pub ivc_target_range_experimental_max_dbfs: i32,
+    pub ivc_target_range_min_dbfs: i32,
+    pub ivc_update_input_volume_wait_frames: i32,
+    pub ivc_speech_probability_threshold: f32,
+    pub ivc_speech_ratio_threshold: f32,
+}
+
+impl Default for MetaAec3Agc2Config {
     fn default() -> Self {
         Self {
-            struct_size: size_of::<MetaAec3Stats>() as i32,
-            status: META_AEC3_OK,
-            processed_samples: 0,
-            output_samples: 0,
-            aec_tap_samples: 0,
-            rnnoise_input_samples: 0,
-            speech_16k_samples: 0,
-            sample_rate_hz: 0,
-            frame_size_ms: 0,
-            capture_channels: 0,
-            render_channels: 0,
-            internal_sample_rate_hz: 0,
-            aec_enabled: 0,
-            high_pass_enabled: 0,
-            noise_suppression_mode: META_AEC3_NS_NONE,
-            vad_probability: 0.0,
-            vad_is_voice: 0,
-            rms: 0.0,
-            peak: 0.0,
-            recommended_input_volume: -1,
-            post_limiter_applied: 0,
-            echo_return_loss: 0.0,
-            echo_return_loss_enhancement: 0.0,
-            delay_ms: 0,
-            render_jitter_min: 0,
-            render_jitter_max: 0,
-            capture_jitter_min: 0,
-            capture_jitter_max: 0,
-            fft_magnitudes: ptr::null_mut(),
-            fft_capacity: 0,
-            fft_bins_written: 0,
-            fft_size: 0,
-            fft_sample_rate_hz: 0,
+            sample_rate_hz: 48_000,
+            channels: 1,
+            fixed_gain_db: 0.0,
+            enable_adaptive_digital: 1,
+            adaptive_headroom_db: 5.0,
+            adaptive_max_gain_db: 50.0,
+            adaptive_initial_gain_db: 15.0,
+            adaptive_max_gain_change_db_per_second: 6.0,
+            adaptive_max_output_noise_level_dbfs: -50.0,
+            enable_input_volume_controller: 0,
+            use_internal_vad: 1,
+            capture_output_used: 1,
+            ivc_min_input_volume: 20,
+            ivc_clipped_level_min: 70,
+            ivc_clipped_level_step: 15,
+            ivc_clipped_ratio_threshold: 0.1,
+            ivc_clipped_wait_frames: 300,
+            ivc_enable_clipping_predictor: 1,
+            ivc_target_range_max_dbfs: -30,
+            ivc_target_range_experimental_max_dbfs: -12,
+            ivc_target_range_min_dbfs: -50,
+            ivc_update_input_volume_wait_frames: 100,
+            ivc_speech_probability_threshold: 0.7,
+            ivc_speech_ratio_threshold: 0.6,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NoiseSuppressionMode {
-    None,
-    WebRtc,
-    Rnnoise,
+/// Optional analysis returned by `meta_aec3_agc2_process`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetaAec3Agc2Stats {
+    pub struct_size: i32,
+    pub sample_rate_hz: i32,
+    pub channels: i32,
+    pub processed_samples: i32,
+    pub total_processed_samples: u64,
+    pub applied_input_volume: i32,
+    /// -1 when the AGC2 input-volume controller is disabled or has no update.
+    pub recommended_input_volume: i32,
+    pub voice_probability: f32,
+    pub output_rms: f32,
+    pub output_peak: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RuntimeConfig {
-    raw: MetaAec3Config,
-    capture_rate: usize,
-    render_rate: usize,
-    internal_rate: usize,
-    frame_ms: usize,
-    chunks_per_frame: usize,
-    capture_channels: usize,
-    render_channels: usize,
-    enable_high_pass_filter: bool,
-    enable_aec3: bool,
-    noise_suppression_mode: NoiseSuppressionMode,
-    noise_suppression_level: SuppressionLevel,
-    enable_agc2: bool,
-    enable_post_limiter: bool,
-    applied_input_volume: i32,
-    capture_output_used: bool,
-    user_microphone_gain: f32,
-    vad_threshold: f32,
-}
-
-impl RuntimeConfig {
-    fn from_ffi(mut raw: MetaAec3Config) -> Result<Self, i32> {
-        let capture_rate = parse_rate(raw.sample_rate_hz)?;
-        let render_rate = if raw.render_sample_rate_hz <= 0 {
-            capture_rate
-        } else {
-            parse_rate(raw.render_sample_rate_hz)?
-        };
-
-        let frame_ms = match raw.frame_size_ms {
-            10 | 20 | 40 => raw.frame_size_ms as usize,
-            _ => return Err(META_AEC3_INVALID_CONFIG),
-        };
-
-        let capture_channels = match raw.capture_channels {
-            1 | 2 => raw.capture_channels as usize,
-            _ => return Err(META_AEC3_INVALID_CONFIG),
-        };
-
-        let render_channels = match raw.render_channels {
-            1..=8 => raw.render_channels as usize,
-            _ => return Err(META_AEC3_INVALID_CONFIG),
-        };
-
-        let noise_suppression_mode = match raw.noise_suppression_mode {
-            META_AEC3_NS_NONE => NoiseSuppressionMode::None,
-            META_AEC3_NS_WEBRTC => NoiseSuppressionMode::WebRtc,
-            META_AEC3_NS_RNNOISE => NoiseSuppressionMode::Rnnoise,
-            _ => return Err(META_AEC3_INVALID_CONFIG),
-        };
-
-        let noise_suppression_level = match raw.noise_suppression_level {
-            META_AEC3_NS_LEVEL_6_DB => SuppressionLevel::K6dB,
-            META_AEC3_NS_LEVEL_12_DB => SuppressionLevel::K12dB,
-            META_AEC3_NS_LEVEL_18_DB => SuppressionLevel::K18dB,
-            META_AEC3_NS_LEVEL_21_DB => SuppressionLevel::K21dB,
-            _ => return Err(META_AEC3_INVALID_CONFIG),
-        };
-
-        if !raw.user_microphone_gain.is_finite() || raw.user_microphone_gain < 0.0 {
-            return Err(META_AEC3_INVALID_CONFIG);
-        }
-        if !raw.vad_threshold.is_finite() {
-            return Err(META_AEC3_INVALID_CONFIG);
-        }
-        if !raw.agc2_fixed_gain_db.is_finite()
-            || raw.agc2_fixed_gain_db < 0.0
-            || raw.agc2_fixed_gain_db >= 50.0
-        {
-            return Err(META_AEC3_INVALID_CONFIG);
-        }
-
-        raw.sample_rate_hz = capture_rate as i32;
-        raw.render_sample_rate_hz = render_rate as i32;
-        raw.frame_size_ms = frame_ms as i32;
-        raw.capture_channels = capture_channels as i32;
-        raw.render_channels = render_channels as i32;
-        raw.applied_input_volume = raw.applied_input_volume.clamp(0, 255);
-        raw.vad_threshold = raw.vad_threshold.clamp(0.0, 1.0);
-
-        Ok(Self {
-            raw,
-            capture_rate,
-            render_rate,
-            internal_rate: internal_rate_for(capture_rate, render_rate),
-            frame_ms,
-            chunks_per_frame: frame_ms / 10,
-            capture_channels,
-            render_channels,
-            enable_high_pass_filter: raw.enable_high_pass_filter != 0,
-            enable_aec3: raw.enable_aec3 != 0,
-            noise_suppression_mode,
-            noise_suppression_level,
-            enable_agc2: raw.enable_agc2 != 0,
-            enable_post_limiter: raw.enable_post_limiter != 0,
-            applied_input_volume: raw.applied_input_volume,
-            capture_output_used: raw.capture_output_used != 0,
-            user_microphone_gain: raw.user_microphone_gain,
-            vad_threshold: raw.vad_threshold,
-        })
-    }
-
-    fn capture_samples_per_frame(self) -> usize {
-        frames_for_ms(self.capture_rate, self.frame_ms) * self.capture_channels
-    }
-
-    fn render_samples_per_frame_for_channels(self, channels: usize) -> usize {
-        frames_for_ms(self.render_rate, self.frame_ms) * channels
-    }
-
-    fn output_samples_per_frame(self) -> usize {
-        self.capture_samples_per_frame()
-    }
-
-    fn rnnoise_samples_per_frame(self) -> usize {
-        frames_for_ms(48_000, self.frame_ms) * self.capture_channels
-    }
-
-    fn speech_16k_samples_per_frame(self) -> usize {
-        frames_for_ms(16_000, self.frame_ms)
-    }
-
-    fn ten_ms_internal_frames(self) -> usize {
-        self.internal_rate / 100
-    }
-
-    fn ten_ms_capture_frames(self) -> usize {
-        self.capture_rate / 100
-    }
-
-    fn ten_ms_render_frames(self) -> usize {
-        self.render_rate / 100
-    }
-}
-
-struct AudioInputBuffer {
-    stream_config: StreamConfig,
-    audio_buffer: AudioBuffer,
-    planar: Vec<Vec<f32>>,
-}
-
-impl AudioInputBuffer {
-    fn new(input_rate: usize, channels: usize, internal_rate: usize) -> Self {
-        let stream_config = StreamConfig::new(input_rate, channels, false);
-        let audio_buffer = AudioBuffer::from_sample_rates(
-            input_rate,
-            channels,
-            internal_rate,
-            channels,
-            input_rate,
-        );
-        Self {
-            stream_config,
-            audio_buffer,
-            planar: vec![vec![0.0; input_rate / 100]; channels],
-        }
-    }
-
-    fn load_interleaved(
-        &mut self,
-        interleaved: &[f32],
-        input_channels: usize,
-    ) -> Result<&mut AudioBuffer, i32> {
-        let frames = self.stream_config.num_frames();
-        if input_channels == 0 || interleaved.len() != frames * input_channels {
-            return Err(META_AEC3_INVALID_ARGUMENT);
-        }
-
-        copy_interleaved_to_planar_adjusted(
-            interleaved,
-            input_channels,
-            self.stream_config.num_channels(),
-            frames,
-            &mut self.planar,
-        );
-
-        let refs: Vec<&[f32]> = self
-            .planar
-            .iter()
-            .map(|channel| &channel[..frames])
-            .collect();
-        self.audio_buffer.copy_from(&refs, &self.stream_config);
-        Ok(&mut self.audio_buffer)
-    }
-}
-
-struct InterleavedExporter {
-    source_rate: usize,
-    dest_rate: usize,
-    channels: usize,
-    source_frames: usize,
-    dest_frames: usize,
-    resamplers: Vec<PushSincResampler>,
-    scratch: Vec<Vec<f32>>,
-}
-
-impl InterleavedExporter {
-    fn new(source_rate: usize, dest_rate: usize, channels: usize) -> Self {
-        let source_frames = source_rate / 100;
-        let dest_frames = dest_rate / 100;
-        let resamplers = if source_frames != dest_frames {
-            (0..channels)
-                .map(|_| PushSincResampler::new(source_frames, dest_frames))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Self {
-            source_rate,
-            dest_rate,
-            channels,
-            source_frames,
-            dest_frames,
-            resamplers,
-            scratch: vec![vec![0.0; dest_frames]; channels],
-        }
-    }
-
-    fn samples_per_chunk(&self) -> usize {
-        self.dest_frames * self.channels
-    }
-
-    fn export_audio_buffer(&mut self, audio: &AudioBuffer, out: &mut [f32]) -> usize {
-        debug_assert_eq!(audio.num_channels(), self.channels);
-        debug_assert_eq!(audio.num_frames(), self.source_frames);
-        debug_assert!(out.len() >= self.samples_per_chunk());
-
-        if self.source_rate == self.dest_rate {
-            for frame in 0..self.dest_frames {
-                for channel in 0..self.channels {
-                    out[frame * self.channels + channel] =
-                        float_s16_to_unit(audio.channel(channel)[frame]);
-                }
-            }
-            return self.samples_per_chunk();
-        }
-
-        for channel in 0..self.channels {
-            self.resamplers[channel].resample_f32(
-                audio.channel(channel),
-                &mut self.scratch[channel][..self.dest_frames],
-            );
-        }
-
-        for frame in 0..self.dest_frames {
-            for channel in 0..self.channels {
-                out[frame * self.channels + channel] =
-                    float_s16_to_unit(self.scratch[channel][frame]);
-            }
-        }
-
-        self.samples_per_chunk()
-    }
-}
-
-struct MonoExporter {
-    source_rate: usize,
-    dest_rate: usize,
-    source_frames: usize,
-    dest_frames: usize,
-    resampler: Option<PushSincResampler>,
-    mono: Vec<f32>,
-    resampled: Vec<f32>,
-}
-
-impl MonoExporter {
-    fn new(source_rate: usize, dest_rate: usize) -> Self {
-        let source_frames = source_rate / 100;
-        let dest_frames = dest_rate / 100;
-        Self {
-            source_rate,
-            dest_rate,
-            source_frames,
-            dest_frames,
-            resampler: (source_frames != dest_frames)
-                .then(|| PushSincResampler::new(source_frames, dest_frames)),
-            mono: vec![0.0; source_frames],
-            resampled: vec![0.0; dest_frames],
-        }
-    }
-
-    fn export_audio_buffer(&mut self, audio: &AudioBuffer, out: &mut [f32]) -> usize {
-        debug_assert_eq!(audio.num_frames(), self.source_frames);
-        debug_assert!(out.len() >= self.dest_frames);
-
-        mix_audio_buffer_to_mono(audio, &mut self.mono);
-        if self.source_rate == self.dest_rate {
-            for (dst, &src) in out.iter_mut().take(self.dest_frames).zip(self.mono.iter()) {
-                *dst = float_s16_to_unit(src);
-            }
-        } else {
-            self.resampler
-                .as_mut()
-                .expect("resampler must exist when rates differ")
-                .resample_f32(&self.mono, &mut self.resampled);
-            for (dst, &src) in out
-                .iter_mut()
-                .take(self.dest_frames)
-                .zip(self.resampled.iter())
-            {
-                *dst = float_s16_to_unit(src);
-            }
-        }
-
-        self.dest_frames
-    }
-}
-
-pub struct MetaAec3Processor {
-    config: RuntimeConfig,
-    render_io: AudioInputBuffer,
-    capture_io: AudioInputBuffer,
-    rnnoise_io: AudioInputBuffer,
-    final_exporter: InterleavedExporter,
-    aec_tap_exporter: InterleavedExporter,
-    rnnoise_exporter: InterleavedExporter,
-    speech_16k_exporter: MonoExporter,
-    echo: Option<EchoCanceller3>,
-    high_pass: Option<HighPassFilter>,
-    noise_suppressor: Option<NoiseSuppressor>,
-    agc2: Option<GainController2>,
-    post_limiter: Limiter,
-    vad: VoiceActivityDetectorWrapper,
-    last_metrics: Metrics,
-    last_applied_input_volume: Option<i32>,
-    last_recommended_input_volume: i32,
-    post_limiter_applied: bool,
-    pending_rnnoise: bool,
-    analysis_mono: Vec<f32>,
-}
-
-impl MetaAec3Processor {
-    fn new(raw_config: MetaAec3Config) -> Result<Self, i32> {
-        let config = RuntimeConfig::from_ffi(raw_config)?;
-        let mut echo = None;
-        if config.enable_aec3 {
-            let mut echo_config = EchoCanceller3::create_default_config(
-                config.render_channels,
-                config.capture_channels,
-            );
-            echo_config.filter.export_linear_aec_output = raw_config.export_linear_aec_output != 0;
-            let mut instance = EchoCanceller3::new(
-                echo_config,
-                config.internal_rate as i32,
-                config.render_channels,
-                config.capture_channels,
-            );
-            if raw_config.initial_delay_ms >= 0 {
-                instance.set_audio_buffer_delay(raw_config.initial_delay_ms);
-            }
-            echo = Some(instance);
-        }
-
-        let high_pass = config
-            .enable_high_pass_filter
-            .then(|| HighPassFilter::new(config.internal_rate as i32, config.capture_channels));
-
-        let ns_config = NsConfig {
-            target_level: config.noise_suppression_level,
-            analyze_linear_aec_output_when_available: false,
-        };
-        let noise_suppressor = (config.noise_suppression_mode == NoiseSuppressionMode::WebRtc)
-            .then(|| {
-                NoiseSuppressor::new(ns_config, config.internal_rate, config.capture_channels)
-            });
-
-        let agc2 = config.enable_agc2.then(|| {
-            let mut agc_config = GainController2Config::default();
-            agc_config.fixed_digital.gain_db = raw_config.agc2_fixed_gain_db;
-            agc_config.adaptive_digital.enabled = raw_config.agc2_adaptive_digital != 0;
-            agc_config.input_volume_controller.enabled =
-                raw_config.agc2_input_volume_controller != 0;
-            GainController2::new(
-                agc_config,
-                InputVolumeControllerConfig::default(),
-                config.internal_rate,
-                config.capture_channels,
-                true,
-            )
-        });
-
-        Ok(Self {
-            config,
-            render_io: AudioInputBuffer::new(
-                config.render_rate,
-                config.render_channels,
-                config.internal_rate,
-            ),
-            capture_io: AudioInputBuffer::new(
-                config.capture_rate,
-                config.capture_channels,
-                config.internal_rate,
-            ),
-            rnnoise_io: AudioInputBuffer::new(
-                48_000,
-                config.capture_channels,
-                config.internal_rate,
-            ),
-            final_exporter: InterleavedExporter::new(
-                config.internal_rate,
-                config.capture_rate,
-                config.capture_channels,
-            ),
-            aec_tap_exporter: InterleavedExporter::new(
-                config.internal_rate,
-                config.capture_rate,
-                config.capture_channels,
-            ),
-            rnnoise_exporter: InterleavedExporter::new(
-                config.internal_rate,
-                48_000,
-                config.capture_channels,
-            ),
-            speech_16k_exporter: MonoExporter::new(config.internal_rate, 16_000),
-            echo,
-            high_pass,
-            noise_suppressor,
-            agc2,
-            post_limiter: Limiter::new(config.ten_ms_internal_frames()),
-            vad: VoiceActivityDetectorWrapper::new(
-                get_available_cpu_features(),
-                config.internal_rate,
-            ),
-            last_metrics: Metrics::default(),
-            last_applied_input_volume: None,
-            last_recommended_input_volume: -1,
-            post_limiter_applied: false,
-            pending_rnnoise: false,
-            analysis_mono: Vec::with_capacity(
-                config.ten_ms_internal_frames() * config.chunks_per_frame,
-            ),
-        })
-    }
-
-    fn process_render(&mut self, input: &[f32], input_channels: usize) -> Result<i32, i32> {
-        if !(1..=8).contains(&input_channels) {
-            return Err(META_AEC3_INVALID_ARGUMENT);
-        }
-        let expected = self
-            .config
-            .render_samples_per_frame_for_channels(input_channels);
-        if input.len() != expected {
-            return Err(META_AEC3_INVALID_ARGUMENT);
-        }
-        if !self.config.enable_aec3 {
-            return Ok(META_AEC3_OK);
-        }
-
-        let chunk_samples = self.config.ten_ms_render_frames() * input_channels;
-        for chunk in input.chunks_exact(chunk_samples) {
-            let render = self.render_io.load_interleaved(chunk, input_channels)?;
-            render.split_into_frequency_bands();
-            self.echo
-                .as_mut()
-                .expect("AEC3 is enabled")
-                .analyze_render(render);
-        }
-
-        Ok(META_AEC3_OK)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn process_capture(
-        &mut self,
-        input: &[f32],
-        output: Option<&mut [f32]>,
-        aec_tap: Option<&mut [f32]>,
-        rnnoise_input: Option<&mut [f32]>,
-        speech_16k: Option<&mut [f32]>,
-        stats: Option<&mut MetaAec3Stats>,
-    ) -> Result<i32, i32> {
-        if input.len() != self.config.capture_samples_per_frame() {
-            return Err(META_AEC3_INVALID_ARGUMENT);
-        }
-
-        let using_rnnoise = self.config.noise_suppression_mode == NoiseSuppressionMode::Rnnoise;
-        if !using_rnnoise && output.is_none() {
-            return Err(META_AEC3_NULL_POINTER);
-        }
-        if using_rnnoise && rnnoise_input.is_none() {
-            return Err(META_AEC3_NULL_POINTER);
-        }
-
-        self.pending_rnnoise = false;
-        self.post_limiter_applied = false;
-        self.last_recommended_input_volume = -1;
-        self.analysis_mono.clear();
-
-        let input_chunk_samples =
-            self.config.ten_ms_capture_frames() * self.config.capture_channels;
-        let output_chunk_samples = self.final_exporter.samples_per_chunk();
-        let rnnoise_chunk_samples = self.rnnoise_exporter.samples_per_chunk();
-        let speech_chunk_samples = self.speech_16k_exporter.dest_frames;
-
-        let mut output = output;
-        let mut aec_tap = aec_tap;
-        let mut rnnoise_input = rnnoise_input;
-        let mut speech_16k = speech_16k;
-        let mut max_vad = 0.0f32;
-
-        for (chunk_index, input_chunk) in input.chunks_exact(input_chunk_samples).enumerate() {
-            let capture = self
-                .capture_io
-                .load_interleaved(input_chunk, self.config.capture_channels)?;
-
-            if self.config.enable_high_pass_filter {
-                apply_high_pass(self.high_pass.as_mut(), capture);
-            }
-
-            if self.config.enable_aec3 {
-                let echo = self.echo.as_mut().expect("AEC3 is enabled");
-                echo.analyze_capture(capture);
-                capture.split_into_frequency_bands();
-                echo.process_capture(capture, false);
-                self.last_metrics = echo.metrics();
-                capture.merge_frequency_bands();
-            }
-
-            append_mono_from_audio_buffer(capture, &mut self.analysis_mono);
-            max_vad = max_vad.max(analyze_vad_for_chunk(&mut self.vad, capture));
-
-            if let Some(tap) = aec_tap.as_deref_mut() {
-                let offset = chunk_index * output_chunk_samples;
-                self.aec_tap_exporter
-                    .export_audio_buffer(capture, &mut tap[offset..offset + output_chunk_samples]);
-            }
-
-            if let Some(speech) = speech_16k.as_deref_mut() {
-                let offset = chunk_index * speech_chunk_samples;
-                self.speech_16k_exporter.export_audio_buffer(
-                    capture,
-                    &mut speech[offset..offset + speech_chunk_samples],
-                );
-            }
-
-            if let Some(rnnoise) = rnnoise_input.as_deref_mut() {
-                let offset = chunk_index * rnnoise_chunk_samples;
-                self.rnnoise_exporter.export_audio_buffer(
-                    capture,
-                    &mut rnnoise[offset..offset + rnnoise_chunk_samples],
-                );
-            }
-
-            if using_rnnoise {
-                continue;
-            }
-
-            apply_native_noise_suppression(
-                self.config.noise_suppression_mode,
-                &mut self.noise_suppressor,
-                capture,
-            );
-            apply_agc_user_gain_and_limiter(
-                self.config,
-                &mut self.agc2,
-                &mut self.post_limiter,
-                &mut self.last_applied_input_volume,
-                &mut self.last_recommended_input_volume,
-                &mut self.post_limiter_applied,
-                capture,
-            );
-
-            if let Some(out) = output.as_deref_mut() {
-                let offset = chunk_index * output_chunk_samples;
-                self.final_exporter
-                    .export_audio_buffer(capture, &mut out[offset..offset + output_chunk_samples]);
-            }
-        }
-
-        let status = if using_rnnoise {
-            self.pending_rnnoise = true;
-            META_AEC3_NEEDS_RNNOISE
-        } else {
-            META_AEC3_OK
-        };
-
-        self.write_stats(stats, status, max_vad, using_rnnoise);
-        Ok(status)
-    }
-
-    fn finish_rnnoise(
-        &mut self,
-        rnnoise_output: &[f32],
-        output: &mut [f32],
-        stats: Option<&mut MetaAec3Stats>,
-    ) -> Result<i32, i32> {
-        if !self.pending_rnnoise {
-            return Err(META_AEC3_NO_PENDING_RNNOISE);
-        }
-        if rnnoise_output.len() != self.config.rnnoise_samples_per_frame() {
-            return Err(META_AEC3_INVALID_ARGUMENT);
-        }
-        if output.len() < self.config.output_samples_per_frame() {
-            return Err(META_AEC3_BUFFER_TOO_SMALL);
-        }
-
-        self.post_limiter_applied = false;
-        self.last_recommended_input_volume = -1;
-
-        let input_chunk_samples = (48_000 / 100) * self.config.capture_channels;
-        let output_chunk_samples = self.final_exporter.samples_per_chunk();
-        for (chunk_index, input_chunk) in
-            rnnoise_output.chunks_exact(input_chunk_samples).enumerate()
-        {
-            let audio = self
-                .rnnoise_io
-                .load_interleaved(input_chunk, self.config.capture_channels)?;
-            apply_agc_user_gain_and_limiter(
-                self.config,
-                &mut self.agc2,
-                &mut self.post_limiter,
-                &mut self.last_applied_input_volume,
-                &mut self.last_recommended_input_volume,
-                &mut self.post_limiter_applied,
-                audio,
-            );
-
-            let offset = chunk_index * output_chunk_samples;
-            self.final_exporter
-                .export_audio_buffer(audio, &mut output[offset..offset + output_chunk_samples]);
-        }
-
-        self.pending_rnnoise = false;
-        self.write_stats(stats, META_AEC3_OK, 0.0, false);
-        Ok(META_AEC3_OK)
-    }
-
-    fn write_stats(
-        &mut self,
-        stats: Option<&mut MetaAec3Stats>,
-        status: i32,
-        vad_probability: f32,
-        rnnoise_pending: bool,
-    ) {
-        let Some(stats) = stats else {
-            return;
-        };
-        let fft_ptr = stats.fft_magnitudes;
-        let fft_capacity = stats.fft_capacity;
-        *stats = MetaAec3Stats::default();
-        stats.fft_magnitudes = fft_ptr;
-        stats.fft_capacity = fft_capacity;
-
-        stats.status = status;
-        stats.processed_samples = self.config.capture_samples_per_frame() as i32;
-        stats.output_samples = if rnnoise_pending {
-            0
-        } else {
-            self.config.output_samples_per_frame() as i32
-        };
-        stats.aec_tap_samples = self.config.output_samples_per_frame() as i32;
-        stats.rnnoise_input_samples = self.config.rnnoise_samples_per_frame() as i32;
-        stats.speech_16k_samples = self.config.speech_16k_samples_per_frame() as i32;
-        stats.sample_rate_hz = self.config.capture_rate as i32;
-        stats.frame_size_ms = self.config.frame_ms as i32;
-        stats.capture_channels = self.config.capture_channels as i32;
-        stats.render_channels = self.config.render_channels as i32;
-        stats.internal_sample_rate_hz = self.config.internal_rate as i32;
-        stats.aec_enabled = self.config.enable_aec3 as i32;
-        stats.high_pass_enabled = self.config.enable_high_pass_filter as i32;
-        stats.noise_suppression_mode = match self.config.noise_suppression_mode {
-            NoiseSuppressionMode::None => META_AEC3_NS_NONE,
-            NoiseSuppressionMode::WebRtc => META_AEC3_NS_WEBRTC,
-            NoiseSuppressionMode::Rnnoise => META_AEC3_NS_RNNOISE,
-        };
-        stats.vad_probability = vad_probability;
-        stats.vad_is_voice = (vad_probability >= self.config.vad_threshold) as i32;
-        let (rms, peak) = rms_peak_unit_from_float_s16(&self.analysis_mono);
-        stats.rms = rms;
-        stats.peak = peak;
-        stats.recommended_input_volume = self.last_recommended_input_volume;
-        stats.post_limiter_applied = self.post_limiter_applied as i32;
-        stats.echo_return_loss = self.last_metrics.echo_return_loss;
-        stats.echo_return_loss_enhancement = self.last_metrics.echo_return_loss_enhancement;
-        stats.delay_ms = self.last_metrics.delay_ms;
-        stats.render_jitter_min = self.last_metrics.render_jitter_min;
-        stats.render_jitter_max = self.last_metrics.render_jitter_max;
-        stats.capture_jitter_min = self.last_metrics.capture_jitter_min;
-        stats.capture_jitter_max = self.last_metrics.capture_jitter_max;
-        fill_fft_stats(stats, &self.analysis_mono, self.config.internal_rate);
+/// Opaque high-pass filter state. One handle is not safe for concurrent use.
+pub struct MetaAec3HighPass(HighPassHandle);
+/// Opaque AEC3 state. Feed render before its corresponding capture frame.
+pub struct MetaAec3Aec(EchoCancellerHandle);
+/// Opaque AGC2 state. One handle is not safe for concurrent use.
+pub struct MetaAec3Agc2(GainControllerHandle);
+
+fn optional_stats<'a, T>(pointer: *mut T) -> Result<Option<&'a mut T>, i32> {
+    if pointer.is_null() {
+        Ok(None)
+    } else {
+        // SAFETY: The FFI caller promises a valid writable stats record.
+        unsafe { checked_mut(pointer).map(Some) }
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_default_config(config: *mut MetaAec3Config) -> i32 {
-    ffi_status(|| {
-        let config = checked_mut(config)?;
-        *config = MetaAec3Config::default();
-        Ok(META_AEC3_OK)
-    })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_create(config: *const MetaAec3Config) -> *mut MetaAec3Processor {
-    match catch_unwind(AssertUnwindSafe(|| {
-        let raw = if config.is_null() {
-            MetaAec3Config::default()
-        } else {
-            unsafe { *config }
-        };
-        MetaAec3Processor::new(raw)
-            .map(|processor| Box::into_raw(Box::new(processor)))
-            .unwrap_or(ptr::null_mut())
-    })) {
-        Ok(ptr) => ptr,
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_free(processor: *mut MetaAec3Processor) {
-    if !processor.is_null() {
-        unsafe {
-            let _ = Box::from_raw(processor);
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_configure(
-    processor: *mut MetaAec3Processor,
-    config: *const MetaAec3Config,
+pub unsafe extern "C" fn meta_aec3_high_pass_default_config(
+    config: *mut MetaAec3HighPassConfig,
 ) -> i32 {
     ffi_status(|| {
-        let processor = checked_mut(processor)?;
-        let config = checked_ref(config)?;
-        let replacement = MetaAec3Processor::new(*config)?;
-        *processor = replacement;
+        // SAFETY: Checked before dereference.
+        let config = unsafe { checked_mut(config)? };
+        *config = MetaAec3HighPassConfig::default();
         Ok(META_AEC3_OK)
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_get_config(
-    processor: *const MetaAec3Processor,
-    config: *mut MetaAec3Config,
+pub unsafe extern "C" fn meta_aec3_high_pass_create(
+    config: *const MetaAec3HighPassConfig,
+) -> *mut MetaAec3HighPass {
+    ffi_create(|| {
+        let config = if config.is_null() {
+            MetaAec3HighPassConfig::default()
+        } else {
+            // SAFETY: Checked before dereference.
+            unsafe { *checked_ref(config)? }
+        };
+        HighPassHandle::new(config).map(MetaAec3HighPass)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_high_pass_free(handle: *mut MetaAec3HighPass) {
+    if !handle.is_null() {
+        // SAFETY: Ownership was returned by `meta_aec3_high_pass_create`.
+        unsafe { drop(Box::from_raw(handle)) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_high_pass_get_config(
+    handle: *const MetaAec3HighPass,
+    config: *mut MetaAec3HighPassConfig,
 ) -> i32 {
     ffi_status(|| {
-        let processor = checked_ref(processor)?;
-        let config = checked_mut(config)?;
-        *config = processor.config.raw;
+        // SAFETY: Both pointers are checked before use.
+        let handle = unsafe { checked_ref(handle)? };
+        let config = unsafe { checked_mut(config)? };
+        *config = handle.0.config();
         Ok(META_AEC3_OK)
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_reset(processor: *mut MetaAec3Processor) -> i32 {
+pub unsafe extern "C" fn meta_aec3_high_pass_reconfigure(
+    handle: *mut MetaAec3HighPass,
+    config: *const MetaAec3HighPassConfig,
+) -> i32 {
     ffi_status(|| {
-        let processor = checked_mut(processor)?;
-        let raw = processor.config.raw;
-        *processor = MetaAec3Processor::new(raw)?;
+        // SAFETY: Both pointers are checked before use.
+        let handle = unsafe { checked_mut(handle)? };
+        let config = unsafe { *checked_ref(config)? };
+        handle.0.reconfigure(config)?;
         Ok(META_AEC3_OK)
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_set_stream_delay_ms(
-    processor: *mut MetaAec3Processor,
+pub unsafe extern "C" fn meta_aec3_high_pass_reset(handle: *mut MetaAec3HighPass) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Checked before use.
+        let handle = unsafe { checked_mut(handle)? };
+        handle.0.reset();
+        Ok(META_AEC3_OK)
+    })
+}
+
+/// Processes interleaved audio in place. `stats` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_high_pass_process(
+    handle: *mut MetaAec3HighPass,
+    audio: *mut f32,
+    audio_length: i32,
+    stats: *mut MetaAec3HighPassStats,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: The caller supplies a valid high-pass handle and writable audio buffer.
+        let handle = unsafe { checked_mut(handle)? };
+        let audio = unsafe { checked_f32_slice_mut(audio, audio_length)? };
+        let stats = optional_stats(stats)?;
+        handle.0.process(audio, stats)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_high_pass_samples_per_10ms(
+    handle: *const MetaAec3HighPass,
+) -> i32 {
+    match (|| {
+        // SAFETY: Checked before use.
+        let handle = unsafe { checked_ref(handle)? };
+        Ok::<i32, i32>(handle.0.samples_per_10ms())
+    })() {
+        Ok(samples) => samples,
+        Err(status) => status,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_default_config(config: *mut MetaAec3AecConfig) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Checked before dereference.
+        let config = unsafe { checked_mut(config)? };
+        *config = MetaAec3AecConfig::default();
+        Ok(META_AEC3_OK)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_create(
+    config: *const MetaAec3AecConfig,
+) -> *mut MetaAec3Aec {
+    ffi_create(|| {
+        let config = if config.is_null() {
+            MetaAec3AecConfig::default()
+        } else {
+            // SAFETY: Checked before dereference.
+            unsafe { *checked_ref(config)? }
+        };
+        EchoCancellerHandle::new(config).map(MetaAec3Aec)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_free(handle: *mut MetaAec3Aec) {
+    if !handle.is_null() {
+        // SAFETY: Ownership was returned by `meta_aec3_aec_create`.
+        unsafe { drop(Box::from_raw(handle)) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_get_config(
+    handle: *const MetaAec3Aec,
+    config: *mut MetaAec3AecConfig,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Both pointers are checked before use.
+        let handle = unsafe { checked_ref(handle)? };
+        let config = unsafe { checked_mut(config)? };
+        *config = handle.0.config();
+        Ok(META_AEC3_OK)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_reconfigure(
+    handle: *mut MetaAec3Aec,
+    config: *const MetaAec3AecConfig,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Both pointers are checked before use.
+        let handle = unsafe { checked_mut(handle)? };
+        let config = unsafe { *checked_ref(config)? };
+        handle.0.reconfigure(config)?;
+        Ok(META_AEC3_OK)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_reset(handle: *mut MetaAec3Aec) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Checked before use.
+        unsafe { checked_mut(handle)? }.0.reset()?;
+        Ok(META_AEC3_OK)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_set_stream_delay_ms(
+    handle: *mut MetaAec3Aec,
     delay_ms: i32,
 ) -> i32 {
     ffi_status(|| {
-        let processor = checked_mut(processor)?;
-        if delay_ms < 0 {
-            return Err(META_AEC3_INVALID_ARGUMENT);
-        }
-        processor.config.raw.initial_delay_ms = delay_ms;
-        if let Some(echo) = processor.echo.as_mut() {
-            echo.set_audio_buffer_delay(delay_ms);
-        }
+        // SAFETY: Checked before use.
+        unsafe { checked_mut(handle)? }
+            .0
+            .set_stream_delay_ms(delay_ms)?;
         Ok(META_AEC3_OK)
     })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_set_user_microphone_gain(
-    processor: *mut MetaAec3Processor,
-    gain: f32,
+pub unsafe extern "C" fn meta_aec3_aec_set_echo_leakage_status(
+    handle: *mut MetaAec3Aec,
+    leakage_detected: i32,
 ) -> i32 {
     ffi_status(|| {
-        let processor = checked_mut(processor)?;
-        if !gain.is_finite() || gain < 0.0 {
-            return Err(META_AEC3_INVALID_ARGUMENT);
-        }
-        processor.config.raw.user_microphone_gain = gain;
-        processor.config.user_microphone_gain = gain;
+        // SAFETY: Checked before use.
+        unsafe { checked_mut(handle)? }
+            .0
+            .set_echo_leakage_status(leakage_detected != 0);
         Ok(META_AEC3_OK)
     })
 }
 
+/// Queues one or more 10-ms render frames. Render must be called before the
+/// corresponding capture frame, but render and capture do not need to arrive
+/// in a strict one-for-one pattern.
 #[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_capture_samples_per_frame(processor: *const MetaAec3Processor) -> i32 {
-    match checked_ref(processor) {
-        Ok(processor) => processor.config.capture_samples_per_frame() as i32,
-        Err(status) => status,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_output_samples_per_frame(processor: *const MetaAec3Processor) -> i32 {
-    match checked_ref(processor) {
-        Ok(processor) => processor.config.output_samples_per_frame() as i32,
-        Err(status) => status,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_rnnoise_samples_per_frame(processor: *const MetaAec3Processor) -> i32 {
-    match checked_ref(processor) {
-        Ok(processor) => processor.config.rnnoise_samples_per_frame() as i32,
-        Err(status) => status,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_speech_16k_samples_per_frame(
-    processor: *const MetaAec3Processor,
-) -> i32 {
-    match checked_ref(processor) {
-        Ok(processor) => processor.config.speech_16k_samples_per_frame() as i32,
-        Err(status) => status,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_fft_bins_per_frame(processor: *const MetaAec3Processor) -> i32 {
-    match checked_ref(processor) {
-        Ok(processor) => {
-            let fft_size = (processor.config.ten_ms_internal_frames()
-                * processor.config.chunks_per_frame)
-                .next_power_of_two();
-            (fft_size / 2 + 1) as i32
-        }
-        Err(status) => status,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_process_render(
-    processor: *mut MetaAec3Processor,
-    samples: *const f32,
-    samples_len: i32,
-    channels: i32,
+pub unsafe extern "C" fn meta_aec3_aec_process_render(
+    handle: *mut MetaAec3Aec,
+    render: *const f32,
+    render_length: i32,
 ) -> i32 {
     ffi_status(|| {
-        let processor = checked_mut(processor)?;
-        let channels = usize_from_positive_i32(channels)?;
-        let samples = checked_f32_slice(samples, samples_len)?;
-        processor.process_render(samples, channels)
+        // SAFETY: The caller supplies a valid handle and readable input buffer.
+        let handle = unsafe { checked_mut(handle)? };
+        let render = unsafe { checked_f32_slice(render, render_length)? };
+        handle.0.process_render(render)
     })
 }
 
+/// Processes one or more 10-ms capture frames. `linear_output` is optional;
+/// it is valid only if `export_linear_aec_output` was enabled at creation. It
+/// receives the native 16-kHz linear-filter tap (160 samples per capture
+/// channel for each 10-ms frame). `stats` may be null. Input and output
+/// buffers must not overlap.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn meta_aec3_process_capture(
-    processor: *mut MetaAec3Processor,
-    capture_samples: *const f32,
-    capture_samples_len: i32,
-    output_samples: *mut f32,
-    output_samples_len: i32,
-    aec_tap_samples: *mut f32,
-    aec_tap_samples_len: i32,
-    rnnoise_input_samples: *mut f32,
-    rnnoise_input_samples_len: i32,
-    speech_16k_samples: *mut f32,
-    speech_16k_samples_len: i32,
-    stats: *mut MetaAec3Stats,
+pub unsafe extern "C" fn meta_aec3_aec_process_capture(
+    handle: *mut MetaAec3Aec,
+    capture: *const f32,
+    capture_length: i32,
+    output: *mut f32,
+    output_length: i32,
+    linear_output: *mut f32,
+    linear_output_length: i32,
+    input_volume_changed: i32,
+    stats: *mut MetaAec3AecStats,
 ) -> i32 {
-    let status = ffi_status(|| {
-        let processor = checked_mut(processor)?;
-        let capture = checked_f32_slice(capture_samples, capture_samples_len)?;
-        let output = optional_f32_slice_mut(
-            output_samples,
-            output_samples_len,
-            processor.config.output_samples_per_frame(),
-        )?;
-        let aec_tap = optional_f32_slice_mut(
-            aec_tap_samples,
-            aec_tap_samples_len,
-            processor.config.output_samples_per_frame(),
-        )?;
-        let rnnoise = optional_f32_slice_mut(
-            rnnoise_input_samples,
-            rnnoise_input_samples_len,
-            processor.config.rnnoise_samples_per_frame(),
-        )?;
-        let speech_16k = optional_f32_slice_mut(
-            speech_16k_samples,
-            speech_16k_samples_len,
-            processor.config.speech_16k_samples_per_frame(),
-        )?;
-        let stats = optional_stats_mut(stats)?;
-        processor.process_capture(capture, output, aec_tap, rnnoise, speech_16k, stats)
-    });
-
-    if status < META_AEC3_OK {
-        write_error_status(stats, status);
-    }
-    status
+    ffi_status(|| {
+        // SAFETY: The caller supplies valid non-overlapping input/output buffers.
+        let handle = unsafe { checked_mut(handle)? };
+        let capture = unsafe { checked_f32_slice(capture, capture_length)? };
+        let output = unsafe { checked_f32_slice_mut(output, output_length)? };
+        let linear_output = optional_output(linear_output, linear_output_length, 0)?;
+        let stats = optional_stats(stats)?;
+        handle.0.process_capture(
+            capture,
+            output,
+            linear_output,
+            input_volume_changed != 0,
+            stats,
+        )
+    })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_finish_rnnoise_frame(
-    processor: *mut MetaAec3Processor,
-    rnnoise_output_samples: *const f32,
-    rnnoise_output_samples_len: i32,
-    output_samples: *mut f32,
-    output_samples_len: i32,
-    stats: *mut MetaAec3Stats,
+pub unsafe extern "C" fn meta_aec3_aec_get_metrics(
+    handle: *const MetaAec3Aec,
+    metrics: *mut MetaAec3AecMetrics,
 ) -> i32 {
-    let status = ffi_status(|| {
-        let processor = checked_mut(processor)?;
-        let rnnoise_output = checked_f32_slice(rnnoise_output_samples, rnnoise_output_samples_len)?;
-        let output = checked_f32_slice_mut(output_samples, output_samples_len)?;
-        if output.len() < processor.config.output_samples_per_frame() {
-            return Err(META_AEC3_BUFFER_TOO_SMALL);
-        }
-        let stats = optional_stats_mut(stats)?;
-        processor.finish_rnnoise(rnnoise_output, output, stats)
-    });
-
-    if status < META_AEC3_OK {
-        write_error_status(stats, status);
-    }
-    status
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_status_ok() -> i32 {
-    META_AEC3_OK
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn meta_aec3_status_needs_rnnoise() -> i32 {
-    META_AEC3_NEEDS_RNNOISE
-}
-
-fn parse_rate(rate: i32) -> Result<usize, i32> {
-    match rate {
-        8_000 | 12_000 | 16_000 | 24_000 | 48_000 => Ok(rate as usize),
-        _ => Err(META_AEC3_INVALID_CONFIG),
-    }
-}
-
-fn internal_rate_for(capture_rate: usize, render_rate: usize) -> usize {
-    let min_rate = capture_rate.min(render_rate);
-    if min_rate <= 16_000 {
-        16_000
-    } else if min_rate <= 32_000 {
-        32_000
-    } else {
-        48_000
-    }
-}
-
-fn frames_for_ms(rate: usize, frame_ms: usize) -> usize {
-    rate * frame_ms / 1000
-}
-
-fn ffi_status<F>(f: F) -> i32
-where
-    F: FnOnce() -> Result<i32, i32>,
-{
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(Ok(status)) => status,
-        Ok(Err(status)) => status,
-        Err(_) => META_AEC3_PANIC,
-    }
-}
-
-fn checked_ref<'a, T>(ptr: *const T) -> Result<&'a T, i32> {
-    if ptr.is_null() {
-        return Err(META_AEC3_NULL_POINTER);
-    }
-    Ok(unsafe { &*ptr })
-}
-
-fn checked_mut<'a, T>(ptr: *mut T) -> Result<&'a mut T, i32> {
-    if ptr.is_null() {
-        return Err(META_AEC3_NULL_POINTER);
-    }
-    Ok(unsafe { &mut *ptr })
-}
-
-fn checked_f32_slice<'a>(ptr: *const f32, len: i32) -> Result<&'a [f32], i32> {
-    if ptr.is_null() {
-        return Err(META_AEC3_NULL_POINTER);
-    }
-    if len <= 0 || !is_aligned_for_f32(ptr) {
-        return Err(META_AEC3_INVALID_ARGUMENT);
-    }
-    Ok(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
-}
-
-fn checked_f32_slice_mut<'a>(ptr: *mut f32, len: i32) -> Result<&'a mut [f32], i32> {
-    if ptr.is_null() {
-        return Err(META_AEC3_NULL_POINTER);
-    }
-    if len <= 0 || !is_aligned_for_f32(ptr) {
-        return Err(META_AEC3_INVALID_ARGUMENT);
-    }
-    Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) })
-}
-
-fn optional_f32_slice_mut<'a>(
-    ptr: *mut f32,
-    len: i32,
-    required_len: usize,
-) -> Result<Option<&'a mut [f32]>, i32> {
-    if ptr.is_null() {
-        return Ok(None);
-    }
-    if len < 0 || !is_aligned_for_f32(ptr) {
-        return Err(META_AEC3_INVALID_ARGUMENT);
-    }
-    if (len as usize) < required_len {
-        return Err(META_AEC3_BUFFER_TOO_SMALL);
-    }
-    Ok(Some(unsafe {
-        std::slice::from_raw_parts_mut(ptr, len as usize)
-    }))
-}
-
-fn optional_stats_mut<'a>(ptr: *mut MetaAec3Stats) -> Result<Option<&'a mut MetaAec3Stats>, i32> {
-    if ptr.is_null() {
-        return Ok(None);
-    }
-    Ok(Some(unsafe { &mut *ptr }))
-}
-
-fn write_error_status(stats: *mut MetaAec3Stats, status: i32) {
-    if stats.is_null() {
-        return;
-    }
-    unsafe {
-        let fft_ptr = (*stats).fft_magnitudes;
-        let fft_capacity = (*stats).fft_capacity;
-        *stats = MetaAec3Stats::default();
-        (*stats).fft_magnitudes = fft_ptr;
-        (*stats).fft_capacity = fft_capacity;
-        (*stats).status = status;
-    }
-}
-
-fn usize_from_positive_i32(value: i32) -> Result<usize, i32> {
-    if value <= 0 {
-        Err(META_AEC3_INVALID_ARGUMENT)
-    } else {
-        Ok(value as usize)
-    }
-}
-
-fn is_aligned_for_f32(ptr: *const f32) -> bool {
-    (ptr as usize) % align_of::<f32>() == 0
-}
-
-fn copy_interleaved_to_planar_adjusted(
-    interleaved: &[f32],
-    input_channels: usize,
-    target_channels: usize,
-    frames: usize,
-    planar: &mut [Vec<f32>],
-) {
-    debug_assert_eq!(planar.len(), target_channels);
-    if target_channels == 1 && input_channels > 1 {
-        let mono = &mut planar[0][..frames];
-        for frame in 0..frames {
-            let mut sum = 0.0f32;
-            for channel in 0..input_channels {
-                sum += interleaved[frame * input_channels + channel];
-            }
-            mono[frame] = sum / input_channels as f32;
-        }
-        return;
-    }
-
-    for target_channel in 0..target_channels {
-        let source_channel = if target_channel < input_channels {
-            target_channel
-        } else {
-            0
+    ffi_status(|| {
+        // SAFETY: Both pointers are checked before use.
+        let handle = unsafe { checked_ref(handle)? };
+        let metrics = unsafe { checked_mut(metrics)? };
+        let current = handle.0.metrics();
+        *metrics = MetaAec3AecMetrics {
+            echo_return_loss: current.echo_return_loss,
+            echo_return_loss_enhancement: current.echo_return_loss_enhancement,
+            delay_ms: current.delay_ms,
+            render_jitter_min: current.render_jitter_min,
+            render_jitter_max: current.render_jitter_max,
+            capture_jitter_min: current.capture_jitter_min,
+            capture_jitter_max: current.capture_jitter_max,
         };
-        let output = &mut planar[target_channel][..frames];
-        for frame in 0..frames {
-            output[frame] = interleaved[frame * input_channels + source_channel];
-        }
+        Ok(META_AEC3_OK)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_render_samples_per_10ms(handle: *const MetaAec3Aec) -> i32 {
+    match (|| {
+        // SAFETY: Checked before use.
+        Ok::<i32, i32>(unsafe { checked_ref(handle)? }.0.render_samples_per_10ms())
+    })() {
+        Ok(samples) => samples,
+        Err(status) => status,
     }
 }
 
-fn apply_high_pass(filter: Option<&mut HighPassFilter>, audio: &mut AudioBuffer) {
-    let Some(filter) = filter else {
-        return;
-    };
-    let channels = audio.num_channels();
-    let mut working = (0..channels)
-        .map(|channel| audio.channel(channel).to_vec())
-        .collect::<Vec<_>>();
-    filter.process(&mut working);
-    for (channel, source) in working.iter().enumerate() {
-        audio.channel_mut(channel).copy_from_slice(source);
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_aec_capture_samples_per_10ms(handle: *const MetaAec3Aec) -> i32 {
+    match (|| {
+        // SAFETY: Checked before use.
+        Ok::<i32, i32>(unsafe { checked_ref(handle)? }.0.capture_samples_per_10ms())
+    })() {
+        Ok(samples) => samples,
+        Err(status) => status,
     }
 }
 
-fn apply_native_noise_suppression(
-    mode: NoiseSuppressionMode,
-    noise_suppressor: &mut Option<NoiseSuppressor>,
-    audio: &mut AudioBuffer,
-) {
-    if mode != NoiseSuppressionMode::WebRtc {
-        return;
-    }
-    if let Some(ns) = noise_suppressor.as_mut() {
-        audio.split_into_frequency_bands();
-        ns.analyze(audio);
-        ns.process(audio);
-        audio.merge_frequency_bands();
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_default_config(config: *mut MetaAec3Agc2Config) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Checked before dereference.
+        let config = unsafe { checked_mut(config)? };
+        *config = MetaAec3Agc2Config::default();
+        Ok(META_AEC3_OK)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_create(
+    config: *const MetaAec3Agc2Config,
+) -> *mut MetaAec3Agc2 {
+    ffi_create(|| {
+        let config = if config.is_null() {
+            MetaAec3Agc2Config::default()
+        } else {
+            // SAFETY: Checked before dereference.
+            unsafe { *checked_ref(config)? }
+        };
+        GainControllerHandle::new(config).map(MetaAec3Agc2)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_free(handle: *mut MetaAec3Agc2) {
+    if !handle.is_null() {
+        // SAFETY: Ownership was returned by `meta_aec3_agc2_create`.
+        unsafe { drop(Box::from_raw(handle)) };
     }
 }
 
-fn apply_agc_user_gain_and_limiter(
-    config: RuntimeConfig,
-    agc2: &mut Option<GainController2>,
-    post_limiter: &mut Limiter,
-    last_applied_input_volume: &mut Option<i32>,
-    last_recommended_input_volume: &mut i32,
-    post_limiter_applied: &mut bool,
-    audio: &mut AudioBuffer,
-) {
-    if let Some(agc2) = agc2.as_mut() {
-        agc2.set_capture_output_used(config.capture_output_used);
-        agc2.analyze(config.applied_input_volume, audio);
-        let input_volume_changed = *last_applied_input_volume != Some(config.applied_input_volume);
-        agc2.process(input_volume_changed, audio);
-        *last_applied_input_volume = Some(config.applied_input_volume);
-        *last_recommended_input_volume = agc2.recommended_input_volume().unwrap_or(-1);
-    }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_get_config(
+    handle: *const MetaAec3Agc2,
+    config: *mut MetaAec3Agc2Config,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Both pointers are checked before use.
+        let handle = unsafe { checked_ref(handle)? };
+        let config = unsafe { checked_mut(config)? };
+        *config = handle.0.config();
+        Ok(META_AEC3_OK)
+    })
+}
 
-    let channels = audio.num_channels();
-    let mut working = (0..channels)
-        .map(|channel| audio.channel(channel).to_vec())
-        .collect::<Vec<_>>();
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_reconfigure(
+    handle: *mut MetaAec3Agc2,
+    config: *const MetaAec3Agc2Config,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Both pointers are checked before use.
+        let handle = unsafe { checked_mut(handle)? };
+        let config = unsafe { *checked_ref(config)? };
+        handle.0.reconfigure(config)?;
+        Ok(META_AEC3_OK)
+    })
+}
 
-    let gain = config.user_microphone_gain;
-    if (gain - 1.0).abs() > f32::EPSILON {
-        for channel in &mut working {
-            for sample in channel {
-                *sample *= gain;
-                if sample.abs() > 32767.0 {
-                    *post_limiter_applied = true;
-                }
-            }
-        }
-    }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_reset(handle: *mut MetaAec3Agc2) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Checked before use.
+        unsafe { checked_mut(handle)? }.0.reset()?;
+        Ok(META_AEC3_OK)
+    })
+}
 
-    if config.enable_post_limiter {
-        let mut refs = working
-            .iter_mut()
-            .map(|channel| channel.as_mut_slice())
-            .collect::<Vec<_>>();
-        post_limiter.set_samples_per_channel(audio.num_frames());
-        post_limiter.process(&mut refs);
-    }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_set_fixed_gain_db(
+    handle: *mut MetaAec3Agc2,
+    gain_db: f32,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Checked before use.
+        unsafe { checked_mut(handle)? }
+            .0
+            .set_fixed_gain_db(gain_db)?;
+        Ok(META_AEC3_OK)
+    })
+}
 
-    for (channel, source) in working.iter().enumerate() {
-        audio.channel_mut(channel).copy_from_slice(source);
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_set_capture_output_used(
+    handle: *mut MetaAec3Agc2,
+    used: i32,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: Checked before use.
+        unsafe { checked_mut(handle)? }
+            .0
+            .set_capture_output_used(used != 0);
+        Ok(META_AEC3_OK)
+    })
+}
+
+/// Processes one or more 10-ms frames. Input and output buffers must not
+/// overlap. `stats` may be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_process(
+    handle: *mut MetaAec3Agc2,
+    input: *const f32,
+    input_length: i32,
+    output: *mut f32,
+    output_length: i32,
+    applied_input_volume: i32,
+    input_volume_changed: i32,
+    stats: *mut MetaAec3Agc2Stats,
+) -> i32 {
+    ffi_status(|| {
+        // SAFETY: The caller supplies valid non-overlapping input/output buffers.
+        let handle = unsafe { checked_mut(handle)? };
+        let input = unsafe { checked_f32_slice(input, input_length)? };
+        let output = unsafe { checked_f32_slice_mut(output, output_length)? };
+        let stats = optional_stats(stats)?;
+        handle.0.process(
+            input,
+            output,
+            applied_input_volume,
+            input_volume_changed != 0,
+            stats,
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_agc2_samples_per_10ms(handle: *const MetaAec3Agc2) -> i32 {
+    match (|| {
+        // SAFETY: Checked before use.
+        Ok::<i32, i32>(unsafe { checked_ref(handle)? }.0.samples_per_10ms())
+    })() {
+        Ok(samples) => samples,
+        Err(status) => status,
     }
 }
 
-fn analyze_vad_for_chunk(vad: &mut VoiceActivityDetectorWrapper, audio: &AudioBuffer) -> f32 {
-    let frame = (0..audio.num_channels())
-        .map(|channel| audio.channel(channel))
-        .collect::<Vec<_>>();
-    vad.analyze(&frame)
+/// Lets C/C# callers verify that their `struct_size` agrees with this binary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_sizeof_high_pass_stats() -> i32 {
+    size_of::<MetaAec3HighPassStats>() as i32
 }
 
-fn append_mono_from_audio_buffer(audio: &AudioBuffer, output: &mut Vec<f32>) {
-    let frames = audio.num_frames();
-    let channels = audio.num_channels();
-    for frame in 0..frames {
-        let mut sample = 0.0f32;
-        for channel in 0..channels {
-            sample += audio.channel(channel)[frame];
-        }
-        output.push(sample / channels as f32);
-    }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_sizeof_aec_stats() -> i32 {
+    size_of::<MetaAec3AecStats>() as i32
 }
 
-fn mix_audio_buffer_to_mono(audio: &AudioBuffer, output: &mut [f32]) {
-    let frames = audio.num_frames();
-    let channels = audio.num_channels();
-    debug_assert!(output.len() >= frames);
-    for frame in 0..frames {
-        let mut sample = 0.0f32;
-        for channel in 0..channels {
-            sample += audio.channel(channel)[frame];
-        }
-        output[frame] = sample / channels as f32;
-    }
-}
-
-fn float_s16_to_unit(value: f32) -> f32 {
-    value.clamp(-32768.0, 32767.0) / 32768.0
-}
-
-fn rms_peak_unit_from_float_s16(samples: &[f32]) -> (f32, f32) {
-    if samples.is_empty() {
-        return (0.0, 0.0);
-    }
-    let mut sum_squares = 0.0f32;
-    let mut peak = 0.0f32;
-    for &sample in samples {
-        let unit = float_s16_to_unit(sample);
-        sum_squares += unit * unit;
-        peak = peak.max(unit.abs());
-    }
-    ((sum_squares / samples.len() as f32).sqrt(), peak)
-}
-
-fn fill_fft_stats(stats: &mut MetaAec3Stats, mono_float_s16: &[f32], sample_rate: usize) {
-    stats.fft_sample_rate_hz = sample_rate as i32;
-    if mono_float_s16.is_empty() {
-        return;
-    }
-
-    let fft_size = mono_float_s16.len().next_power_of_two();
-    let bins = fft_size / 2 + 1;
-    stats.fft_size = fft_size as i32;
-
-    if stats.fft_magnitudes.is_null() || stats.fft_capacity <= 0 {
-        return;
-    }
-    if !is_aligned_for_f32(stats.fft_magnitudes) {
-        return;
-    }
-
-    let write_bins = bins.min(stats.fft_capacity as usize);
-    let output = unsafe { std::slice::from_raw_parts_mut(stats.fft_magnitudes, write_bins) };
-
-    let mut spectrum = vec![Complex32::new(0.0, 0.0); fft_size];
-    for (dst, &src) in spectrum.iter_mut().zip(mono_float_s16.iter()) {
-        dst.re = float_s16_to_unit(src);
-    }
-
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(fft_size);
-    fft.process(&mut spectrum);
-
-    let scale = 1.0 / fft_size as f32;
-    for index in 0..write_bins {
-        output[index] = spectrum[index].norm() * scale;
-    }
-    stats.fft_bins_written = write_bins as i32;
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn meta_aec3_sizeof_agc2_stats() -> i32 {
+    size_of::<MetaAec3Agc2Stats>() as i32
 }
 
 #[cfg(test)]
@@ -1431,144 +934,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_creates_processor() {
-        let mut config = MetaAec3Config::default();
-        assert_eq!(META_AEC3_OK, meta_aec3_default_config(&mut config));
-        let ptr = meta_aec3_create(&config);
-        assert!(!ptr.is_null());
-        assert_eq!(480, meta_aec3_capture_samples_per_frame(ptr));
-        meta_aec3_free(ptr);
+    fn high_pass_handle_processes_in_place() {
+        // SAFETY: All pointers below come from live Rust values with matching lengths.
+        unsafe {
+            let handle = meta_aec3_high_pass_create(std::ptr::null());
+            assert!(!handle.is_null());
+            // 40 ms of 48-kHz mono audio.
+            let mut audio = vec![0.25f32; 1_920];
+            let mut stats = MetaAec3HighPassStats::default();
+            assert_eq!(
+                meta_aec3_high_pass_process(
+                    handle,
+                    audio.as_mut_ptr(),
+                    audio.len() as i32,
+                    &mut stats
+                ),
+                META_AEC3_OK
+            );
+            assert_eq!(stats.processed_samples, 1_920);
+            assert!(stats.output_peak.is_finite());
+            meta_aec3_high_pass_free(handle);
+        }
     }
 
     #[test]
-    fn processes_silence_with_native_path() {
-        let mut config = MetaAec3Config::default();
-        config.capture_channels = 1;
-        config.render_channels = 2;
-        config.frame_size_ms = 10;
-        let ptr = meta_aec3_create(&config);
-        assert!(!ptr.is_null());
+    fn aec_accepts_eight_channel_render_and_exports_metrics() {
+        // SAFETY: All pointers below come from live Rust values with matching lengths.
+        unsafe {
+            let config = MetaAec3AecConfig {
+                render_channels: 8,
+                export_linear_aec_output: 1,
+                ..Default::default()
+            };
+            let handle = meta_aec3_aec_create(&config);
+            assert!(!handle.is_null());
 
-        let render = vec![0.0f32; 480 * 2];
-        assert_eq!(
-            META_AEC3_OK,
-            meta_aec3_process_render(ptr, render.as_ptr(), render.len() as i32, 2)
-        );
-
-        let capture = vec![0.0f32; 480];
-        let mut output = vec![0.0f32; 480];
-        let mut tap = vec![0.0f32; 480];
-        let mut speech = vec![0.0f32; 160];
-        let mut fft = vec![0.0f32; meta_aec3_fft_bins_per_frame(ptr) as usize];
-        let mut stats = MetaAec3Stats {
-            fft_magnitudes: fft.as_mut_ptr(),
-            fft_capacity: fft.len() as i32,
-            ..MetaAec3Stats::default()
-        };
-
-        let status = meta_aec3_process_capture(
-            ptr,
-            capture.as_ptr(),
-            capture.len() as i32,
-            output.as_mut_ptr(),
-            output.len() as i32,
-            tap.as_mut_ptr(),
-            tap.len() as i32,
-            ptr::null_mut(),
-            0,
-            speech.as_mut_ptr(),
-            speech.len() as i32,
-            &mut stats,
-        );
-
-        assert_eq!(META_AEC3_OK, status);
-        assert_eq!(META_AEC3_OK, stats.status);
-        assert_eq!(480, stats.output_samples);
-        assert!(stats.fft_bins_written > 0);
-        meta_aec3_free(ptr);
+            // Two 10-ms frames arrive together (20 ms total).
+            let render = vec![0.0f32; 480 * 8 * 2];
+            assert_eq!(
+                meta_aec3_aec_process_render(handle, render.as_ptr(), render.len() as i32),
+                META_AEC3_OK
+            );
+            let capture = vec![0.0f32; 960];
+            let mut output = vec![0.0f32; 960];
+            let mut linear = vec![0.0f32; 320];
+            let mut stats = MetaAec3AecStats::default();
+            assert_eq!(
+                meta_aec3_aec_process_capture(
+                    handle,
+                    capture.as_ptr(),
+                    capture.len() as i32,
+                    output.as_mut_ptr(),
+                    output.len() as i32,
+                    linear.as_mut_ptr(),
+                    linear.len() as i32,
+                    0,
+                    &mut stats,
+                ),
+                META_AEC3_OK
+            );
+            assert_eq!(stats.processed_samples, 960);
+            assert!(stats.voice_probability.is_finite());
+            meta_aec3_aec_free(handle);
+        }
     }
 
     #[test]
-    fn rnnoise_path_requires_finish() {
-        let mut config = MetaAec3Config::default();
-        config.noise_suppression_mode = META_AEC3_NS_RNNOISE;
-        let ptr = meta_aec3_create(&config);
-        assert!(!ptr.is_null());
-
-        let capture = vec![0.0f32; 480];
-        let mut rnnoise_input = vec![0.0f32; 480];
-        let mut stats = MetaAec3Stats::default();
-        let status = meta_aec3_process_capture(
-            ptr,
-            capture.as_ptr(),
-            capture.len() as i32,
-            ptr::null_mut(),
-            0,
-            ptr::null_mut(),
-            0,
-            rnnoise_input.as_mut_ptr(),
-            rnnoise_input.len() as i32,
-            ptr::null_mut(),
-            0,
-            &mut stats,
-        );
-        assert_eq!(META_AEC3_NEEDS_RNNOISE, status);
-
-        let mut output = vec![0.0f32; 480];
-        let finish_status = meta_aec3_finish_rnnoise_frame(
-            ptr,
-            rnnoise_input.as_ptr(),
-            rnnoise_input.len() as i32,
-            output.as_mut_ptr(),
-            output.len() as i32,
-            &mut stats,
-        );
-        assert_eq!(META_AEC3_OK, finish_status);
-        meta_aec3_free(ptr);
-    }
-
-    #[test]
-    fn supports_8k_capture_and_wide_render_input() {
-        let mut config = MetaAec3Config::default();
-        config.sample_rate_hz = 8_000;
-        config.render_sample_rate_hz = 48_000;
-        config.frame_size_ms = 20;
-        config.capture_channels = 2;
-        config.render_channels = 2;
-        config.noise_suppression_mode = META_AEC3_NS_NONE;
-
-        let ptr = meta_aec3_create(&config);
-        assert!(!ptr.is_null());
-        assert_eq!(320, meta_aec3_capture_samples_per_frame(ptr));
-        assert_eq!(320, meta_aec3_output_samples_per_frame(ptr));
-        assert_eq!(320, meta_aec3_speech_16k_samples_per_frame(ptr));
-
-        let render = vec![0.0f32; 960 * 8];
-        assert_eq!(
-            META_AEC3_OK,
-            meta_aec3_process_render(ptr, render.as_ptr(), render.len() as i32, 8)
-        );
-
-        let capture = vec![0.0f32; 320];
-        let mut output = vec![0.0f32; 320];
-        let mut stats = MetaAec3Stats::default();
-        let status = meta_aec3_process_capture(
-            ptr,
-            capture.as_ptr(),
-            capture.len() as i32,
-            output.as_mut_ptr(),
-            output.len() as i32,
-            ptr::null_mut(),
-            0,
-            ptr::null_mut(),
-            0,
-            ptr::null_mut(),
-            0,
-            &mut stats,
-        );
-        assert_eq!(META_AEC3_OK, status);
-        assert_eq!(16_000, stats.internal_sample_rate_hz);
-        assert_eq!(320, stats.output_samples);
-        meta_aec3_free(ptr);
+    fn agc2_processes_after_aec_output() {
+        // SAFETY: All pointers below come from live Rust values with matching lengths.
+        unsafe {
+            let handle = meta_aec3_agc2_create(std::ptr::null());
+            assert!(!handle.is_null());
+            let input = vec![0.01f32; 960];
+            let mut output = vec![0.0f32; 960];
+            let mut stats = MetaAec3Agc2Stats::default();
+            assert_eq!(
+                meta_aec3_agc2_process(
+                    handle,
+                    input.as_ptr(),
+                    input.len() as i32,
+                    output.as_mut_ptr(),
+                    output.len() as i32,
+                    255,
+                    0,
+                    &mut stats,
+                ),
+                META_AEC3_OK
+            );
+            assert_eq!(stats.processed_samples, 960);
+            assert!(stats.output_peak.is_finite());
+            meta_aec3_agc2_free(handle);
+        }
     }
 }
